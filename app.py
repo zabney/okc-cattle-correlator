@@ -3,11 +3,11 @@ import requests
 import pandas as pd
 from requests.auth import HTTPBasicAuth
 
-st.set_page_config(page_title="OKC Multi-Class Correlator", layout="wide")
+st.set_page_config(page_title="OKC Steer & Heifer Correlator", layout="wide")
 API_KEY = 'pEhHNZ2t9pmJrZ9/3ZeYI1i4gbJ5HB4Y'
 
 @st.cache_data(ttl=3600)
-def get_clean_data():
+def get_feeder_data():
     url = "https://marsapi.ams.usda.gov/services/v1.1/reports/1831"
     try:
         response = requests.get(url, auth=HTTPBasicAuth(API_KEY, ''), timeout=15)
@@ -15,33 +15,23 @@ def get_clean_data():
         
         scrubbed = []
         for r in raw:
-            # --- THE RATIONALE LOGIC ---
-            # 1. Start with Feeder Grade
-            grade_val = r.get('frame_muscle')
-            
-            # 2. If no Feeder Grade, check Slaughter Grade + Dressing
-            if not grade_val or grade_val == "N/A":
-                base_grade = r.get('grade') or "Standard"
-                dress = r.get('dressing')
-                grade_val = f"{base_grade} ({dress})" if dress else base_grade
+            sex = r.get('class')
+            # 1. Eliminate everything except Steers and Heifers
+            if sex not in ["Steers", "Heifers"]:
+                continue
                 
-            # 3. If still nothing, check Replacement Age/Stage
-            if grade_val == "Standard":
-                age = r.get('age')
-                stage = r.get('stage')
-                if age: grade_val = f"{age} / {stage}" if stage else age
+            grade = r.get('frame_muscle')
+            price = r.get('avg_price')
+            weight = r.get('avg_weight')
 
-            # Final check: Price and Weight must exist
-            p, w = r.get('avg_price'), r.get('avg_weight')
-            if p and w:
+            if grade and price and weight:
                 scrubbed.append({
                     'date': r.get('report_begin_date'),
-                    'group': r.get('group') or 'Feeder Cattle',
-                    'sex': r.get('class') or 'N/A',
-                    'grade': grade_val,
-                    'avg_wgt': float(w),
-                    'price': float(p),
-                    'range': r.get('wgt_range')
+                    'sex': sex,
+                    'grade': grade,
+                    'range': r.get('wgt_range'),
+                    'avg_wgt': float(weight),
+                    'price': float(price)
                 })
         
         df = pd.DataFrame(scrubbed)
@@ -50,33 +40,70 @@ def get_clean_data():
     except:
         return None, "Connection Error"
 
-# --- UI INTERFACE ---
-df, market_date = get_clean_data()
+# --- SIDEBAR: SIMPLE SELECTION ---
+df, market_date = get_feeder_data()
 
 if df is not None:
     with st.sidebar:
         st.header("1. Selection")
-        # Narrow down by Category (Feeder vs Slaughter)
-        cat = st.selectbox("Category", sorted(df['group'].unique()))
-        df_cat = df[df['group'] == cat]
+        # Only two choices now: Steer or Heifer
+        sex_choice = st.radio("Animal Class", ["Steers", "Heifers"])
+        df_sex = df[df['sex'] == sex_choice]
         
-        # Narrow down by Sex (Steer vs Cow)
-        sex = st.selectbox("Sex", sorted(df_cat['sex'].unique()))
-        df_sex = df_cat[df_cat['sex'] == sex]
-        
-        # Narrow down by Grade (The logic fix)
-        grade = st.selectbox("Grade / Dressing", sorted(df_sex['grade'].unique()))
+        # Specific Feeder Grade (e.g., Medium & Large 1)
+        grade_choice = st.selectbox("Feeder Grade", sorted(df_sex['grade'].unique()))
         
         st.divider()
-        st.header("2. Costs")
-        adg = st.slider("ADG", 0.5, 4.0, 2.0)
-        cog = st.number_input("Cost of Gain", value=0.95)
+        st.header("2. Production")
+        adg = st.slider("ADG (lbs/day)", 0.5, 4.0, 2.2, 0.1)
+        cog = st.number_input("Cost of Gain ($/lb)", value=0.95, step=0.05)
 
-    st.title("📊 OKC Cattle Correlator")
-    st.info(f"Using OKC Report from {market_date}")
+    # --- MAIN DASHBOARD ---
+    st.title(f"📈 {sex_choice} Profit Correlator")
+    st.caption(f"Latest OKC Data: {market_date}")
 
-    # Calculation logic...
-    final = df_sex[df_sex['grade'] == grade].sort_values('avg_wgt')
+    final = df_sex[df_sex['grade'] == grade_choice].sort_values('avg_wgt')
+
     if not final.empty:
-        # (Weights and Math logic goes here)
-        st.dataframe(final[['range', 'avg_wgt', 'price']], hide_index=True)
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("📥 Purchase")
+            p_label = st.selectbox("Buy Weight Bracket", list(final['range']), index=0)
+            p_row = final[final['range'] == p_label].iloc[0]
+            p_val = (p_row['price'] / 100) * p_row['avg_wgt']
+            st.metric("Purchase Price", f"${p_row['price']:.2f}")
+            st.write(f"Buy Weight: {int(p_row['avg_wgt'])} lbs")
+            st.write(f"Total Buy: ${p_val:,.2f}")
+
+        with col2:
+            st.subheader("📤 Sale")
+            s_label = st.selectbox("Sale Weight Bracket", list(final['range']), index=len(final)-1)
+            s_row = final[final['range'] == s_label].iloc[0]
+            s_val = (s_row['price'] / 100) * s_row['avg_wgt']
+            st.metric("Sale Price", f"${s_row['price']:.2f}")
+            st.write(f"Sale Weight: {int(s_row['avg_wgt'])} lbs")
+            st.write(f"Total Sale: ${s_val:,.2f}")
+
+        # --- THE VOG - COG = ROG CALCULATION ---
+        st.divider()
+        gain = s_row['avg_wgt'] - p_row['avg_wgt']
+        
+        if gain > 0:
+            # Value of Gain (The actual value of the added weight)
+            vog = (s_val - p_val) / gain
+            # Return on Gain (Profit per pound)
+            rog = vog - cog
+            net = rog * gain
+            days = gain / adg
+
+            res1, res2, res3 = st.columns(3)
+            res1.metric("Value of Gain (VOG)", f"${vog:.2f}")
+            res2.metric("Return on Gain (ROG)", f"${rog:.2f}", delta=f"${rog:.2f}")
+            res3.metric("Net Profit / Head", f"${net:,.2f}")
+            
+            st.info(f"📅 This program requires **{int(days)} days** at an ADG of {adg}.")
+        else:
+            st.warning("Please select a sale weight higher than the purchase weight.")
+    else:
+        st.error("No data found for this grade.")
